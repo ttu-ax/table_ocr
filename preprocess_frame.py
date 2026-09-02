@@ -27,6 +27,7 @@ class PreprocessFrame(ttk.Frame):
 
     # --- tool ids ---------------------------------------------------------- #
     TOOL_DRAG = "drag"
+    TOOL_MANUAL = "manual"
     TOOL_EYEDROPPER = "eyedropper"
     TOOL_BRUSH = "brush"
 
@@ -52,6 +53,7 @@ class PreprocessFrame(ttk.Frame):
         self._view_ox = 0.0     # canvas dx
         self._view_oy = 0.0     # canvas dy
         self._drag_corner: int | None = None
+        self._manual_points: list[tuple[float, float]] = []
         self._active_stroke: ip.Stroke | None = None
         self._cached_photo: ImageTk.PhotoImage | None = None
         self._cached_original_id: int | None = None
@@ -98,6 +100,8 @@ class PreprocessFrame(ttk.Frame):
         self._tool_var = tk.StringVar(master=self, value=self.TOOL_DRAG)
         ttk.Radiobutton(pg, text="拖动角点", value=self.TOOL_DRAG,
                         variable=self._tool_var, command=self._set_tool).pack(fill="x")
+        ttk.Radiobutton(pg, text="手动取四点", value=self.TOOL_MANUAL,
+                        variable=self._tool_var, command=self.start_manual_points).pack(fill="x")
         ttk.Button(pg, text="重置角点", command=self.reset_corners).pack(fill="x", pady=(4, 0))
         ttk.Checkbutton(pg, text="矫正后加白边", variable=self._add_white_border).pack(fill="x", anchor="w")
 
@@ -248,6 +252,30 @@ class PreprocessFrame(ttk.Frame):
     def reset_corners(self) -> None:
         self.auto_rectify()
 
+    # --- Manual four-point placement ---------------------------------------- #
+    def start_manual_points(self) -> None:
+        """Enter manual mode: clicking four corners builds the quad."""
+        self._tool = self.TOOL_MANUAL
+        self._manual_points = []
+        self._quad = None
+        self._render()
+
+    def _finish_manual_points(self) -> None:
+        if len(self._manual_points) == 4:
+            self._quad = ip.Quad(np.array(self._manual_points, dtype=np.float32).reshape(4, 2))
+        self._manual_points = []
+        if self._quad is not None:
+            self._tool = self.TOOL_DRAG
+            self._tool_var.set(self.TOOL_DRAG)
+        self._render()
+
+    def _add_manual_point(self, img_pt: tuple[float, float]) -> None:
+        self._manual_points.append(self._clamp_to_image(img_pt))
+        if len(self._manual_points) >= 4:
+            self._finish_manual_points()
+        else:
+            self._render()
+
     def _clamp_to_image(self, pt: tuple[float, float]) -> tuple[float, float]:
         if self._original is None:
             return pt
@@ -297,6 +325,8 @@ class PreprocessFrame(ttk.Frame):
             self.canvas.configure(cursor="circle")
         elif self._tool == self.TOOL_EYEDROPPER:
             self.canvas.configure(cursor="crosshair")
+        elif self._tool == self.TOOL_MANUAL:
+            self.canvas.configure(cursor="crosshair")
         elif self._hit_corner(img_pt) is not None:
             self.canvas.configure(cursor="fleur")
         else:
@@ -309,6 +339,9 @@ class PreprocessFrame(ttk.Frame):
         if self._tool == self.TOOL_EYEDROPPER:
             self._sample_color(img_pt)
             return
+        if self._tool == self.TOOL_MANUAL:
+            self._add_manual_point(img_pt)
+            return
         if self._tool == self.TOOL_BRUSH:
             self._active_stroke = ip.Stroke(color=self._color_bgr, radius=int(self._brush_radius.get()))
             self._active_stroke.points.append(img_pt)
@@ -318,6 +351,8 @@ class PreprocessFrame(ttk.Frame):
         hit = self._hit_corner(img_pt)
         if hit is not None:
             self._drag_corner = hit
+        else:
+            self.app.log_status("未检测到自动四点，请点「手动取四点」在图上点选 4 个角点")
 
     def _on_motion(self, event) -> None:
         if self._original is None:
@@ -498,6 +533,22 @@ class PreprocessFrame(ttk.Frame):
                 self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=hexc,
                                         outline="", tags=("paint",))
 
+        # Manual four-point placement: render already-placed points and guides.
+        if self._tool == self.TOOL_MANUAL and self._manual_points:
+            pts = [self._img_to_canvas(x, y) for x, y in self._manual_points]
+            for cx, cy in pts:
+                self.canvas.create_oval(cx - 7, cy - 7, cx + 7, cy + 7,
+                                        fill="#ff9900", outline="#ffffff", width=1,
+                                        tags=("manual",))
+            if len(pts) >= 2:
+                self.canvas.create_line(*[c for pt in pts for c in pt], fill="#ff9900",
+                                        width=2, dash=(4, 3), tags=("manual",))
+            self.canvas.create_text(
+                self.canvas.winfo_width() / 2, 24,
+                text=f"手动取四点：已选 {len(self._manual_points)}/4，请在图上点击表格四角",
+                fill="#ff9900", font=("Microsoft YaHei UI", 11, "bold"), tags=("manual",),
+            )
+
         # Document quad + draggable corner handles.
         if self._quad is not None:
             pts = [self._img_to_canvas(qx, qy) for qx, qy in self._quad.points.tolist()]
@@ -509,6 +560,13 @@ class PreprocessFrame(ttk.Frame):
                                         tags=("corner", f"corner_{i}"))
                 self.canvas.create_text(cx, cy - 14, text=str(i + 1), fill="#00ff00",
                                         font=("Arial", 10, "bold"), tags=("corner",))
+        elif self._tool != self.TOOL_MANUAL:
+            # Auto-detection failed: give the user a clear action hint.
+            self.canvas.create_text(
+                self.canvas.winfo_width() / 2, self.canvas.winfo_height() - 28,
+                text="未自动识别到四点，请在右侧点「手动取四点」在图上点击表格四角",
+                fill="#ff5555", font=("Microsoft YaHei UI", 11, "bold"), tags=("hint",),
+            )
 
     def _render_image(self, bgr: np.ndarray, source: str) -> None:
         self.canvas.delete("all")

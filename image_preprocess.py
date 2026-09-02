@@ -82,20 +82,36 @@ def detect_document_quad(image: np.ndarray) -> Quad | None:
         iterations=2,
     )
     contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    minimum_area = width * height * 0.20
-    quad: np.ndarray | None = None
+    # The document/table grid is usually the dominant connected component, but on
+    # a page that is mostly blank (table at top, big empty bottom) its area can be
+    # well under 20% of the image.  Prefer a 4-point convex hull whose area is the
+    # largest *plausible* share, and always fall back to the largest contour's
+    # min-area-rect so detection rarely returns None.
+    grid_area = float(width * height)
     sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    quad: np.ndarray | None = None
+    best: np.ndarray | None = None
+    best_area = 0.0
     for contour in sorted_contours:
-        if cv2.contourArea(contour) < minimum_area:
+        area = float(cv2.contourArea(contour))
+        if area < grid_area * 0.04:   # ignore tiny specks
             break
         hull = cv2.convexHull(contour)
         perimeter = cv2.arcLength(hull, True)
+        if perimeter <= 0:
+            continue
         approximation = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
         if len(approximation) == 4 and cv2.isContourConvex(approximation):
             quad = approximation.reshape(4, 2).astype(np.float32) / detection_scale
             break
-    if quad is None and sorted_contours and cv2.contourArea(sorted_contours[0]) >= minimum_area:
-        box = cv2.boxPoints(cv2.minAreaRect(sorted_contours[0]))
+        # Keep the largest contour regardless of point count for the fallback.
+        if area > best_area:
+            best_area = area
+            best = contour
+
+    if quad is None and best is not None:
+        box = cv2.boxPoints(cv2.minAreaRect(best))
         quad = box.astype(np.float32) / detection_scale
 
     if quad is None:
