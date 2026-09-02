@@ -9,6 +9,7 @@ place of the raw photo, which improves OCR accuracy.
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -116,7 +117,6 @@ class PreprocessFrame(ttk.Frame):
         self._toolbar_window = self.toolbar_canvas.create_window((0, 0), window=bar, anchor="nw")
         bar.bind("<Configure>", self._on_toolbar_size)
         self.toolbar_canvas.bind("<Configure>", self._on_toolbar_view)
-        self.toolbar_canvas.bind("<MouseWheel>", lambda e: self.toolbar_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
 
         bar.columnconfigure(0, weight=1)
 
@@ -164,11 +164,11 @@ class PreprocessFrame(ttk.Frame):
         ttk.Checkbutton(ag, text="透视矫正", variable=self._use_rectify).pack(anchor="w")
         ttk.Checkbutton(ag, text="涂抹覆盖", variable=self._apply_paint).pack(anchor="w")
         ttk.Button(ag, text="✍ 保存全部改动", command=self.save_all_changes).pack(fill="x", pady=(6, 2))
-        ttk.Button(ag, text="应用到当前图", command=self.apply_to_current).pack(fill="x", pady=2)
-        ttk.Button(ag, text="套用当前参数到全部", command=self.apply_to_all).pack(fill="x", pady=2)
         ttk.Button(ag, text="预览矫正结果", command=self.preview_warp).pack(fill="x", pady=2)
         ttk.Button(ag, text="重置本图", command=self.reset_image).pack(fill="x", pady=(2, 2))
         ttk.Button(ag, text="重置全部改动", command=self.reset_all).pack(fill="x", pady=2)
+
+        self._bind_toolbar_wheel()
 
     # ------------------------------------------------------------------ #
     # Event bindings
@@ -184,6 +184,29 @@ class PreprocessFrame(ttk.Frame):
 
     def _set_tool(self) -> None:
         self._tool = self._tool_var.get()
+
+    def _bind_toolbar_wheel(self) -> None:
+        """Make the mouse wheel scroll the right toolbar from anywhere over it.
+
+        Wheel events go to the widget under the cursor (a button / frame inside
+        ``bar``), not the toolbar canvas, so binding only the canvas was not
+        enough.  Recursively bind every descendant to scroll the toolbar, and
+        stop propagation so it never reaches the image-canvas zoom handler.
+        """
+        def scroll(event) -> str:
+            delta = 1 if getattr(event, "delta", 0) > 0 else -1
+            self.toolbar_canvas.yview_scroll(-delta, "units")
+            return "break"
+
+        def _recurse(widget) -> None:
+            widget.bind("<MouseWheel>", scroll, add="+")
+            widget.bind("<Button-4>", lambda e: self.toolbar_canvas.yview_scroll(-1, "units"), add="+")
+            widget.bind("<Button-5>", lambda e: self.toolbar_canvas.yview_scroll(1, "units"), add="+")
+            for child in widget.winfo_children():
+                _recurse(child)
+
+        _recurse(self._toolbar_inner)
+        self.toolbar_canvas.bind("<MouseWheel>", scroll, add="+")
 
     # --- right-toolbar scroll sizing ---------------------------------------- #
     def _on_toolbar_size(self, _event) -> None:
@@ -407,6 +430,7 @@ class PreprocessFrame(ttk.Frame):
             self._tool = self.TOOL_DRAG
             self._tool_var.set(self.TOOL_DRAG)
             self._mark_modified()
+            self._auto_save_current()
         self._render()
 
     def _add_manual_point(self, img_pt: tuple[float, float]) -> None:
@@ -517,12 +541,14 @@ class PreprocessFrame(ttk.Frame):
                 self._undo = self._undo[-self.UNDO_LIMIT:]
                 self._redo.clear()
                 self._mark_modified()
+                self._auto_save_current()
             self._active_stroke = None
             self._render_overlay()
             return
         if self._drag_corner is not None:
             self._drag_corner = None
             self._mark_modified()
+            self._auto_save_current()
 
     # ------------------------------------------------------------------ #
     # Color sampling + palette
@@ -585,71 +611,86 @@ class PreprocessFrame(ttk.Frame):
             result = ip.warp_document(base_img, self._quad, self._add_white_border.get())
         return result
 
-    def apply_to_current(self) -> None:
-        result = self._build_processed()
-        if result is None:
-            return
-        if not (0 <= self._current_index < len(self.files)):
-            return
-        path = self.files[self._current_index]
-        self.app.set_preprocessed(path, cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
-        self._snapshot_current()
-        self._refresh_marker()
-        self.app.log_status(f"已应用预处理到 {path.name}")
+    def _process_one(self, path: Path, edit: dict,
+                     use_rectify: bool, apply_paint: bool, add_border: bool) -> bool:
+        """Build + encode one edited image into the OCR cache. Returns success.
 
-    def apply_to_all(self) -> None:
-        """Apply the *current* image's quad + paint settings to every file."""
-        if not self.files or self._original is None:
-            return
-        current = self._build_processed()
-        if current is None:
-            return
-        for path in list(self.files):
+        Runs in a worker thread, so it must not touch Tk variables: the boolean
+        options are passed in from the caller (read on the UI thread first).
+        """
+        try:
             encoded = np.fromfile(str(path), dtype=np.uint8)
             img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
             if img is None:
-                continue
-            img_out = img
-            if self._apply_paint.get() and not self._painter.empty:
-                img_out = self._painter.composite(img)
-            if self._use_rectify.get() and self._quad is not None:
-                img_out = ip.warp_document(img_out, self._quad, self._add_white_border.get())
-            self.app.set_preprocessed(path, cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
-            # Record each file as edited so the ●已修改 marker stays consistent.
-            key = str(Path(path).resolve()).casefold()
-            self._edits.setdefault(key, {})["quad"] = self._quad
-            self._edits.setdefault(key, {})["strokes"] = list(self._painter.strokes)
-        self._refresh_marker()
-        self.app.log_status(f"已将预处理参数应用到全部 {len(self.files)} 张图片")
-
-    def save_all_changes(self) -> None:
-        """One-click save: flush every edited image to the OCR cache at once."""
-        if not self.files:
-            return
-        saved = 0
-        for path in list(self.files):
-            key = str(Path(path).resolve()).casefold()
-            edit = self._edits.get(key)
-            if edit is None:
-                continue
-            encoded = np.fromfile(str(path), dtype=np.uint8)
-            img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-            if img is None:
-                continue
+                return False
             img_out = img
             quad = edit.get("quad")
             strokes = list(edit.get("strokes", []))
-            if self._apply_paint.get() and strokes:
+            if apply_paint and strokes:
                 p = ip.Painter()
                 for stroke in strokes:
                     p.add_stroke(stroke)
                 img_out = p.composite(img)
-            if self._use_rectify.get() and quad is not None:
-                img_out = ip.warp_document(img_out, quad, self._add_white_border.get())
-            self.app.set_preprocessed(path, cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
-            saved += 1
-        self._refresh_marker()
-        self.app.log_status(f"已保存 {saved} 张图片的预处理改动")
+            if use_rectify and quad is not None:
+                img_out = ip.warp_document(img_out, quad, add_border)
+            packed = cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+            self.app.set_preprocessed(path, packed)
+            return True
+        except Exception:
+            return False
+
+    def _auto_save_current(self) -> None:
+        """After an edit, autosave the current image to the OCR cache (background)."""
+        if self._original is None:
+            return
+        path = self.files[self._current_index] if 0 <= self._current_index < len(self.files) else None
+        if path is None:
+            return
+        key = str(Path(path).resolve()).casefold()
+        edit = self._edits.get(key)
+        if edit is None:
+            return
+        # Read the toggles on the UI thread now, so the worker never touches Tk.
+        use_rectify = bool(self._use_rectify.get())
+        apply_paint = bool(self._apply_paint.get())
+        add_border = bool(self._add_white_border.get())
+        self.app.log_status(f"正在自动保存 {path.name}…")
+
+        def worker() -> None:
+            ok = self._process_one(path, edit, use_rectify, apply_paint, add_border)
+            self.app.events.put(
+                ("preprocess_saved", {"path": path.name, "ok": ok, "saved": 1, "auto": True})
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_all_changes(self) -> None:
+        """Background: flush every *edited* image to the OCR cache at once."""
+        if not self.files:
+            return
+        # Snapshot the edited set (keeps per-image quad/strokes) so the worker
+        # does not race with further on-screen edits.
+        snapshot = [(path, dict(self._edits[key])) for path, key in
+                    ((p, str(Path(p).resolve()).casefold()) for p in self.files)
+                    if key in self._edits]
+        if not snapshot:
+            self.app.log_status("没有已修改的图片需要保存")
+            return
+        use_rectify = bool(self._use_rectify.get())
+        apply_paint = bool(self._apply_paint.get())
+        add_border = bool(self._add_white_border.get())
+        self.app.log_status(f"正在后台保存 {len(snapshot)} 张图片的预处理改动…")
+
+        def worker() -> None:
+            saved = 0
+            for path, edit in snapshot:
+                if self._process_one(path, edit, use_rectify, apply_paint, add_border):
+                    saved += 1
+            self.app.events.put(
+                ("preprocess_saved", {"path": "", "ok": True, "saved": saved, "auto": False})
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def reset_image(self) -> None:
         if not (0 <= self._current_index < len(self.files)):

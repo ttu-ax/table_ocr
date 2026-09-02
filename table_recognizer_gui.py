@@ -1322,6 +1322,23 @@ class TableRecognizerApp:
                     self.status.set("处理失败")
                     self._append_log(str(value))
                     messagebox.showerror("处理失败", str(value))
+                elif kind == "preprocess_saved":
+                    info = dict(value)  # type: ignore[arg-type]
+                    saved = int(info.get("saved", 0))
+                    auto = bool(info.get("auto", False))
+                    path_name = info.get("path", "")
+                    if auto:
+                        if info.get("ok"):
+                            self.status.set(f"已自动保存：{path_name}")
+                            self._append_log(f"已自动保存处理结果到 {path_name}")
+                        else:
+                            self.status.set(f"自动保存失败：{path_name}")
+                    else:
+                        self.status.set(f"已保存 {saved} 张图片的预处理改动")
+                        self._append_log(f"已保存 {saved} 张图片的预处理改动")
+                    frame = getattr(self, "_preprocess_frame", None)
+                    if frame is not None:
+                        frame._refresh_marker()
         except queue.Empty:
             pass
         self.root.after(100, self._drain_events)
