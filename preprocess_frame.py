@@ -163,8 +163,7 @@ class PreprocessFrame(ttk.Frame):
         ag.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(ag, text="透视矫正", variable=self._use_rectify).pack(anchor="w")
         ttk.Checkbutton(ag, text="涂抹覆盖", variable=self._apply_paint).pack(anchor="w")
-        ttk.Button(ag, text="✍ 保存全部改动", command=self.save_all_changes).pack(fill="x", pady=(6, 2))
-        ttk.Button(ag, text="预览矫正结果", command=self.preview_warp).pack(fill="x", pady=2)
+        ttk.Button(ag, text="预览矫正结果", command=self.preview_warp).pack(fill="x", pady=(6, 2))
         ttk.Button(ag, text="重置本图", command=self.reset_image).pack(fill="x", pady=(2, 2))
         ttk.Button(ag, text="重置全部改动", command=self.reset_all).pack(fill="x", pady=2)
 
@@ -660,34 +659,6 @@ class PreprocessFrame(ttk.Frame):
             ok = self._process_one(path, edit, use_rectify, apply_paint, add_border)
             self.app.events.put(
                 ("preprocess_saved", {"path": path.name, "ok": ok, "saved": 1, "auto": True})
-            )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def save_all_changes(self) -> None:
-        """Background: flush every *edited* image to the OCR cache at once."""
-        if not self.files:
-            return
-        # Snapshot the edited set (keeps per-image quad/strokes) so the worker
-        # does not race with further on-screen edits.
-        snapshot = [(path, dict(self._edits[key])) for path, key in
-                    ((p, str(Path(p).resolve()).casefold()) for p in self.files)
-                    if key in self._edits]
-        if not snapshot:
-            self.app.log_status("没有已修改的图片需要保存")
-            return
-        use_rectify = bool(self._use_rectify.get())
-        apply_paint = bool(self._apply_paint.get())
-        add_border = bool(self._add_white_border.get())
-        self.app.log_status(f"正在后台保存 {len(snapshot)} 张图片的预处理改动…")
-
-        def worker() -> None:
-            saved = 0
-            for path, edit in snapshot:
-                if self._process_one(path, edit, use_rectify, apply_paint, add_border):
-                    saved += 1
-            self.app.events.put(
-                ("preprocess_saved", {"path": "", "ok": True, "saved": saved, "auto": False})
             )
 
         threading.Thread(target=worker, daemon=True).start()
