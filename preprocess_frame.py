@@ -81,12 +81,18 @@ class PreprocessFrame(ttk.Frame):
         ttk.Label(nav, textvariable=self._title_var).pack(side="left")
         ttk.Button(nav, text="加载当前选中", command=self.load_current_selection).pack(side="right")
 
-        # --- canvas --------------------------------------------------------- #
+        # --- canvas + scrollbars ------------------------------------------- #
         canvas_frame = ttk.Frame(self, padding=8)
         canvas_frame.grid(row=1, column=0, sticky="nsew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(canvas_frame, bg="#3c3c3c", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda _e: self._render())
+        self.hbar = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self._scroll_x)
+        self.vbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._scroll_y)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar.grid(row=1, column=0, sticky="ew")
+        self.canvas.bind("<Configure>", lambda _e: (self._clamp_view(), self._render()))
 
         # --- right toolbar --------------------------------------------------- #
         bar = ttk.Frame(self, padding=8)
@@ -236,8 +242,68 @@ class PreprocessFrame(ttk.Frame):
         h = self.canvas.winfo_height() or 1
         ih, iw = self._original.shape[:2]
         self._view_zoom = max(0.02, min(w / iw, h / ih))
+        # Center the image; when larger than the viewport this becomes negative
+        # (the scrollbars then let the user pan).
         self._view_ox = (w - iw * self._view_zoom) / 2
         self._view_oy = (h - ih * self._view_zoom) / 2
+
+    # ------------------------------------------------------------------ #
+    # Scrollbars (pan) + view clamping
+    # ------------------------------------------------------------------ #
+    def _scroll_x(self, *args: str) -> None:
+        if self._original is None:
+            return
+        # args: ("moveto", frac) or ("scroll", units, "units"|"pages")
+        w = self.canvas.winfo_width() or 1
+        iw = self._original.shape[1]
+        img_w = iw * self._view_zoom
+        if img_w <= w:
+            self._view_ox = (w - img_w) / 2
+        elif args[0] == "moveto":
+            self._view_ox = -float(args[1]) * (img_w - w)
+        elif args[0] == "scroll":
+            units, what = int(args[1]), args[2]
+            step = w * 0.9 if what == "pages" else (40 if what == "units" else 40)
+            self._view_ox -= units * step
+        self._clamp_view_x(img_w, w)
+        self._render()
+
+    def _scroll_y(self, *args: str) -> None:
+        if self._original is None:
+            return
+        h = self.canvas.winfo_height() or 1
+        ih = self._original.shape[0]
+        img_h = ih * self._view_zoom
+        if img_h <= h:
+            self._view_oy = (h - img_h) / 2
+        elif args[0] == "moveto":
+            self._view_oy = -float(args[1]) * (img_h - h)
+        elif args[0] == "scroll":
+            units, what = int(args[1]), args[2]
+            step = h * 0.9 if what == "pages" else (40 if what == "units" else 40)
+            self._view_oy -= units * step
+        self._clamp_view_y(img_h, h)
+        self._render()
+
+    def _clamp_view(self) -> None:
+        if self._original is None:
+            return
+        w = self.canvas.winfo_width() or 1
+        h = self.canvas.winfo_height() or 1
+        self._clamp_view_x(self._original.shape[1] * self._view_zoom, w)
+        self._clamp_view_y(self._original.shape[0] * self._view_zoom, h)
+
+    def _clamp_view_x(self, img_w: float, view_w: float) -> None:
+        if img_w <= view_w:
+            self._view_ox = (view_w - img_w) / 2
+        else:
+            self._view_ox = min(0.0, max(view_w - img_w, self._view_ox))
+
+    def _clamp_view_y(self, img_h: float, view_h: float) -> None:
+        if img_h <= view_h:
+            self._view_oy = (view_h - img_h) / 2
+        else:
+            self._view_oy = min(0.0, max(view_h - img_h, self._view_oy))
 
     # ------------------------------------------------------------------ #
     # Four-point correction
@@ -310,6 +376,7 @@ class PreprocessFrame(ttk.Frame):
         self._view_zoom = max(0.02, min(8.0, self._view_zoom * delta))
         self._view_ox = mx - img_x * self._view_zoom
         self._view_oy = my - img_y * self._view_zoom
+        self._clamp_view()
         self._render()
 
     def _on_hover(self, event) -> None:
@@ -569,6 +636,7 @@ class PreprocessFrame(ttk.Frame):
             )
 
     def _render_image(self, bgr: np.ndarray, source: str) -> None:
+        self._clamp_view()
         self.canvas.delete("all")
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         pil_img = self._apply_view(Image.fromarray(rgb))
@@ -577,6 +645,30 @@ class PreprocessFrame(ttk.Frame):
                                  anchor="nw", tags=("photo",))
         if source == "original":
             self._draw_overlays()
+        self._sync_scrollbars()
+
+    def _sync_scrollbars(self) -> None:
+        """Refresh the scrollbar thumbs from the current pan position."""
+        if self._original is None:
+            self.hbar.set(0, 1)
+            self.vbar.set(0, 1)
+            return
+        w = self.canvas.winfo_width() or 1
+        h = self.canvas.winfo_height() or 1
+        img_w = self._original.shape[1] * self._view_zoom
+        img_h = self._original.shape[0] * self._view_zoom
+        if img_w <= w:
+            self.hbar.set(0, 1)
+        else:
+            first = -self._view_ox / (img_w - w)
+            self.hbar.set(max(0.0, min(1.0, first)),
+                          max(0.0, min(1.0, first + w / (img_w - w))))
+        if img_h <= h:
+            self.vbar.set(0, 1)
+        else:
+            first = -self._view_oy / (img_h - h)
+            self.vbar.set(max(0.0, min(1.0, first)),
+                          max(0.0, min(1.0, first + h / (img_h - h))))
 
 
 class TkHsvPalette(ttk.Frame):
