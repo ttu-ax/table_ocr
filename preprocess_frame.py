@@ -764,9 +764,10 @@ class PreprocessFrame(ttk.Frame):
             pts = [self._img_to_canvas(x, y) for x, y in stroke.points]
             r = stroke.radius * self._view_zoom
             hexc = "#%02x%02x%02x" % (stroke.color[2], stroke.color[1], stroke.color[0])
-            self.canvas.create_line(*[c for pt in pts for c in pt], fill=hexc,
-                                    width=max(1, int(r * 2)), capstyle=tk.ROUND,
-                                    joinstyle=tk.ROUND, tags=("paint",))
+            if len(pts) >= 2:
+                self.canvas.create_line(*[c for pt in pts for c in pt], fill=hexc,
+                                        width=max(1, int(r * 2)), capstyle=tk.ROUND,
+                                        joinstyle=tk.ROUND, tags=("paint",))
             for cx, cy in pts:
                 self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=hexc,
                                         outline="", tags=("paint",))
