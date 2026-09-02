@@ -398,7 +398,10 @@ class PreprocessFrame(ttk.Frame):
 
     def _finish_manual_points(self) -> None:
         if len(self._manual_points) == 4:
-            self._quad = ip.Quad(np.array(self._manual_points, dtype=np.float32).reshape(4, 2))
+            # Click order does not matter: sort the four points into TL/TR/BR/BL
+            # so the perspective warp is correct regardless of click order.
+            ordered = ip.order_quad(np.array(self._manual_points, dtype=np.float32))
+            self._quad = ip.Quad(ordered)
         self._manual_points = []
         if self._quad is not None:
             self._tool = self.TOOL_DRAG
