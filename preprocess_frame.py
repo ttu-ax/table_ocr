@@ -336,7 +336,7 @@ class PreprocessFrame(ttk.Frame):
             step = w * 0.9 if what == "pages" else (40 if what == "units" else 40)
             self._view_ox -= units * step
         self._clamp_view_x(img_w, w)
-        self._render()
+        self._render_pan()
 
     def _scroll_y(self, *args: str) -> None:
         if self._original is None:
@@ -353,7 +353,7 @@ class PreprocessFrame(ttk.Frame):
             step = h * 0.9 if what == "pages" else (40 if what == "units" else 40)
             self._view_oy -= units * step
         self._clamp_view_y(img_h, h)
-        self._render()
+        self._render_pan()
 
     def _clamp_view(self) -> None:
         if self._original is None:
@@ -483,7 +483,7 @@ class PreprocessFrame(ttk.Frame):
         if self._tool == self.TOOL_BRUSH:
             self._active_stroke = ip.Stroke(color=self._color_bgr, radius=int(self._brush_radius.get()))
             self._active_stroke.points.append(img_pt)
-            self._render()
+            self._render_overlay()
             return
         # DRAG tool: grab a corner if near one
         hit = self._hit_corner(img_pt)
@@ -500,11 +500,11 @@ class PreprocessFrame(ttk.Frame):
             last = self._active_stroke.points[-1]
             if abs(img_pt[0] - last[0]) + abs(img_pt[1] - last[1]) >= 1.0:
                 self._active_stroke.points.append(img_pt)
-            self._render()
+            self._render_overlay()
             return
         if self._drag_corner is not None and self._quad is not None:
             self._set_corner(self._drag_corner, img_pt)
-            self._render()
+            self._render_overlay()
 
     def _on_release(self, event) -> None:
         if self._tool == self.TOOL_BRUSH and self._active_stroke is not None:
@@ -515,7 +515,7 @@ class PreprocessFrame(ttk.Frame):
                 self._redo.clear()
                 self._mark_modified()
             self._active_stroke = None
-            self._render()
+            self._render_overlay()
             return
         if self._drag_corner is not None:
             self._drag_corner = None
@@ -688,7 +688,7 @@ class PreprocessFrame(ttk.Frame):
     def _render_preview(self) -> None:
         if self._preview_warped is None:
             return
-        self._render_image(self._preview_warped, source="preview")
+        self._render_base(self._preview_warped, source="preview")
 
     def _render(self) -> None:
         if self._original is None:
@@ -698,7 +698,7 @@ class PreprocessFrame(ttk.Frame):
                 text="请先在“待识别列表”选择并加载图片", fill="#cccccc",
             )
             return
-        self._render_image(self._original, source="original")
+        self._render_base(self._original, source="original")
 
     def _apply_view(self, pil_img: Image.Image) -> Image.Image:
         if self._view_zoom <= 0:
@@ -707,8 +707,53 @@ class PreprocessFrame(ttk.Frame):
         new_h = max(1, int(pil_img.height * self._view_zoom))
         return pil_img.resize((new_w, new_h), Image.LANCZOS)
 
-    def _draw_overlays(self) -> None:
-        """Draw the paint strokes (as canvas items) then the quad corners."""
+    # --- Split "heavy base image" from "light overlay" so drag/paint stays --- #
+    # smooth.  The base (a large BGR photo) is converted/resized/encoded into a
+    # PhotoImage ONLY when the source or the zoom actually changes; it is cached.
+    # Mouse-move actions (corner drag, paint strokes) only redraw the overlay
+    # canvas items, which is orders of magnitude cheaper than re-encoding the
+    # full image every frame.
+    def _on_zoom_changed(self) -> bool:
+        """Force a base re-render when the display zoom changes."""
+        old = getattr(self, "_base_zoom", None)
+        source = getattr(self, "_base_source", None)
+        changed = old != self._view_zoom or source != id(self._original)
+        self._base_zoom = self._view_zoom
+        self._base_source = id(self._original)
+        return changed
+
+    def _render_base(self, bgr: np.ndarray, source: str) -> None:
+        """Render the underlying image; skip the expensive re-encode if unchanged."""
+        self._clamp_view()
+        changed = self._on_zoom_changed()
+        if changed or source != getattr(self, "_base_display_source", None):
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            pil_img = self._apply_view(Image.fromarray(rgb))
+            self._cached_photo = ImageTk.PhotoImage(pil_img)
+            self._base_display_source = source
+        # Always place the photo (cheap) then the overlay.
+        self.canvas.delete("all")
+        self.canvas.create_image(self._view_ox, self._view_oy, image=self._cached_photo,
+                                 anchor="nw", tags=("photo",))
+        if source == "original":
+            self._render_overlay()
+        self._sync_scrollbars()
+
+    def _render_pan(self) -> None:
+        """Reposition the (cached) base photo and redraw overlays only."""
+        items = self.canvas.find_withtag("photo")
+        if items and self._cached_photo is not None:
+            self.canvas.coords(items[0], self._view_ox, self._view_oy)
+        elif self._cached_photo is not None:
+            self.canvas.delete("all")
+            self.canvas.create_image(self._view_ox, self._view_oy, image=self._cached_photo,
+                                     anchor="nw", tags=("photo",))
+        self._render_overlay()
+        self._sync_scrollbars()
+
+    def _render_overlay(self) -> None:
+        """Redraw only the overlay items (paint / quad / manual / hints)."""
+        self.canvas.delete("paint", "manual", "quad", "corner", "hint")
         # Paint strokes, converted to canvas coordinates.
         for stroke in self._painter.strokes + ([self._active_stroke] if self._active_stroke else []):
             if not stroke.points:
@@ -759,16 +804,8 @@ class PreprocessFrame(ttk.Frame):
             )
 
     def _render_image(self, bgr: np.ndarray, source: str) -> None:
-        self._clamp_view()
-        self.canvas.delete("all")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        pil_img = self._apply_view(Image.fromarray(rgb))
-        self._cached_photo = ImageTk.PhotoImage(pil_img)
-        self.canvas.create_image(self._view_ox, self._view_oy, image=self._cached_photo,
-                                 anchor="nw", tags=("photo",))
-        if source == "original":
-            self._draw_overlays()
-        self._sync_scrollbars()
+        # Back-compat alias: full render (base + overlay).
+        self._render_base(bgr, source)
 
     def _sync_scrollbars(self) -> None:
         """Refresh the scrollbar thumbs from the current pan position."""
