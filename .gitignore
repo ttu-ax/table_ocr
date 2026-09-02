@@ -26,3 +26,9 @@ env/
 *.egg-info/
 .idea/
 .vscode/
+
+# --- PyInstaller build artifacts ---
+build/
+dist/
+build.log
+*.spec.bak
