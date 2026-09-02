@@ -544,7 +544,13 @@ def recognize_with_paddle_ocr_vl(
     path, api_url: str, timeout: int = 300
 ) -> list[base.ParsedTable]:
     path = Path(path)
-    rectified = base.rectify_table_image(path)
+    # Use the preprocessed image (from the "图片预处理" tab) if present, else the
+    # default rectified photo.
+    rectified = (
+        base.get_preprocessed(path)
+        if base.get_preprocessed(path) is not None
+        else base.rectify_table_image(path)
+    )
     image_bytes = _fit_pixel_budget(
         rectified, min(MAX_PIXELS, TABLE_BLOCK_MAX_PIXELS), MAX_IMAGE_LONG_EDGE
     )
@@ -560,7 +566,11 @@ def recognize_with_paddle_ocr_vl(
 
 def _dump_raw(path, api_url: str, timeout: int) -> str:
     path = Path(path)
-    rectified = base.rectify_table_image(path)
+    rectified = (
+        base.get_preprocessed(path)
+        if base.get_preprocessed(path) is not None
+        else base.rectify_table_image(path)
+    )
     image_bytes = _fit_pixel_budget(
         rectified, min(MAX_PIXELS, TABLE_BLOCK_MAX_PIXELS), MAX_IMAGE_LONG_EDGE
     )
@@ -575,7 +585,11 @@ def recognize_with_paddle_ocr_vl_debug(
     Useful for CLI inspection/tests; the GUI uses the table-only variant.
     """
     path = Path(path)
-    rectified = base.rectify_table_image(path)
+    rectified = (
+        base.get_preprocessed(path)
+        if base.get_preprocessed(path) is not None
+        else base.rectify_table_image(path)
+    )
     image_bytes = _fit_pixel_budget(
         rectified, min(MAX_PIXELS, TABLE_BLOCK_MAX_PIXELS), MAX_IMAGE_LONG_EDGE
     )

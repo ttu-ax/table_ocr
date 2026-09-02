@@ -21,6 +21,11 @@ import cv2
 import numpy as np
 
 try:
+    from preprocess_frame import PreprocessFrame
+except Exception:  # pragma: no cover - module import must not break the GUI
+    PreprocessFrame = None  # type: ignore[assignment,misc]
+
+try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:
     DND_FILES = None
@@ -36,6 +41,9 @@ except ImportError as exc:
 
 DEFAULT_API = "http://192.168.10.26:8087/table-recognition"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+# Preprocessed images produced by the "图片预处理" tab, keyed by resolved path.
+# When present, recognition uses this JPEG instead of the raw photo.
+PREPROCESSED_IMAGES: dict[str, bytes] = {}
 HEADER_WORDS = {
     "序号", "名称", "姓名", "编号", "代码", "规格", "型号", "单位", "数量",
     "单价", "金额", "日期", "时间", "备注", "项目", "类别", "部门", "地址",
@@ -827,8 +835,33 @@ def _merge_numeric_supplement(primary: ParsedTable, supplement: ParsedTable) -> 
                 primary_row[primary_index] = value
 
 
+def _path_key(path: Path) -> str:
+    return str(Path(path).resolve()).casefold()
+
+
+def set_preprocessed(path: Path, image_bytes: bytes) -> None:
+    """Store a preprocessed image (from the preprocessing tab) for a file."""
+    PREPROCESSED_IMAGES[_path_key(path)] = image_bytes
+
+
+def clear_preprocessed(path: Path) -> None:
+    PREPROCESSED_IMAGES.pop(_path_key(path), None)
+
+
+def get_preprocessed(path: Path) -> bytes | None:
+    return PREPROCESSED_IMAGES.get(_path_key(path))
+
+
+def load_image_bytes(path: Path) -> bytes:
+    """Return the preprocessed image for ``path``, else rectify the raw photo."""
+    cached = get_preprocessed(path)
+    if cached is not None:
+        return cached
+    return rectify_table_image(path)
+
+
 def recognize_image(path: Path, api_url: str, timeout: int = 180) -> list[ParsedTable]:
-    image_bytes = rectify_table_image(path)
+    image_bytes = load_image_bytes(path)
     payload = _request_table_payload(image_bytes, api_url, timeout)
     tables = _tables_from_payload(payload, image_bytes, path.name)
 
@@ -1027,9 +1060,21 @@ class TableRecognizerApp:
         self.root.after(100, self._drain_events)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=14)
-        outer.pack(fill="both", expand=True)
+        # Two-tab layout: recognition list + image preprocessing.
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
 
+        list_tab = ttk.Frame(self.notebook, padding=14)
+        self.notebook.add(list_tab, text="待识别列表")
+        self._build_list_tab(list_tab)
+
+        preprocess_tab = ttk.Frame(self.notebook)
+        self.notebook.add(preprocess_tab, text="图片预处理")
+        self.preprocess_frame = PreprocessFrame(preprocess_tab, self.files, self)
+        self.preprocess_frame.pack(fill="both", expand=True)
+        self._preprocess_frame = self.preprocess_frame
+
+    def _build_list_tab(self, outer: ttk.Frame) -> None:
         ttk.Label(outer, text="待识别图片", font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
         list_frame = ttk.Frame(outer)
         list_frame.pack(fill="both", expand=True, pady=(8, 8))
@@ -1108,10 +1153,17 @@ class TableRecognizerApp:
         for index, path in enumerate(self.files, start=1):
             self.listbox.insert("end", f"{index:02d}. {path.name}")
         self.status.set(f"已添加 {len(self.files)} 张图片")
+        self._notify_preprocess_files()
+
+    def _notify_preprocess_files(self) -> None:
+        frame = getattr(self, "_preprocess_frame", None)
+        if frame is not None:
+            frame.files_changed()
 
     def _remove_selected(self) -> None:
         selected = set(self.listbox.curselection())
-        self.files = [path for index, path in enumerate(self.files) if index not in selected]
+        kept = [path for index, path in enumerate(self.files) if index not in selected]
+        self.files[:] = kept
         self._refresh_list()
 
     def _clear_files(self) -> None:
@@ -1139,6 +1191,17 @@ class TableRecognizerApp:
         self.log.insert("end", text + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    # --- Preprocessing cache bridge (called by the preprocessing tab) ------ #
+    def set_preprocessed(self, path: Path, image_bytes: bytes) -> None:
+        set_preprocessed(path, image_bytes)
+
+    def clear_preprocessed(self, path: Path) -> None:
+        clear_preprocessed(path)
+
+    def log_status(self, text: str) -> None:
+        self._append_log(text)
+        self.status.set(text)
 
     def _start(self) -> None:
         if not self.files:
