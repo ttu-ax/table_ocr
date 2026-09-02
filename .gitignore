@@ -1,0 +1,28 @@
+# --- Local models / deps (too large to version) ---
+MixTeX-Latex-OCR/
+
+# --- Test / scanned input assets (not source) ---
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.pdf
+
+# --- Runtime outputs ---
+*.xlsx
+*_otsl.txt
+*_html.txt
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+.idea/
+.vscode/
