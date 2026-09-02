@@ -59,6 +59,12 @@ class PreprocessFrame(ttk.Frame):
         self._cached_original_id: int | None = None
         self._mouse_canvas = (0.0, 0.0)
 
+        # Per-image pending edits, keyed by the resolved path.  Each entry is
+        # {"quad": Quad|None, "strokes": [Stroke, ...]} so switching images keeps
+        # each image's own four-corner + paint work, and "保存全部改动" can flush
+        # every edited image to the OCR cache in one go.
+        self._edits: dict[str, dict] = {}
+
         self._build_ui()
         self._current_index = -1
         self._bind_events()
@@ -94,9 +100,24 @@ class PreprocessFrame(ttk.Frame):
         self.hbar.grid(row=1, column=0, sticky="ew")
         self.canvas.bind("<Configure>", lambda _e: (self._clamp_view(), self._render()))
 
-        # --- right toolbar --------------------------------------------------- #
-        bar = ttk.Frame(self, padding=8)
-        bar.grid(row=1, column=1, sticky="ns")
+        # --- right toolbar (scrollable) -------------------------------------- #
+        toolbar_wrap = ttk.Frame(self, padding=(0, 8, 8, 8))
+        toolbar_wrap.grid(row=1, column=1, sticky="ns")
+        toolbar_wrap.rowconfigure(0, weight=1)
+        toolbar_wrap.columnconfigure(0, weight=1)
+        self.toolbar_canvas = tk.Canvas(toolbar_wrap, highlightthickness=0, width=230)
+        self.toolbar_vsb = ttk.Scrollbar(toolbar_wrap, orient="vertical",
+                                         command=self.toolbar_canvas.yview)
+        self.toolbar_canvas.configure(yscrollcommand=self.toolbar_vsb.set)
+        self.toolbar_canvas.grid(row=0, column=0, sticky="nsew")
+        self.toolbar_vsb.grid(row=0, column=1, sticky="ns")
+        bar = ttk.Frame(self.toolbar_canvas, padding=8)
+        self._toolbar_inner = bar
+        self._toolbar_window = self.toolbar_canvas.create_window((0, 0), window=bar, anchor="nw")
+        bar.bind("<Configure>", self._on_toolbar_size)
+        self.toolbar_canvas.bind("<Configure>", self._on_toolbar_view)
+        self.toolbar_canvas.bind("<MouseWheel>", lambda e: self.toolbar_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
         bar.columnconfigure(0, weight=1)
 
         # Perspective group
@@ -142,10 +163,12 @@ class PreprocessFrame(ttk.Frame):
         ag.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(ag, text="透视矫正", variable=self._use_rectify).pack(anchor="w")
         ttk.Checkbutton(ag, text="涂抹覆盖", variable=self._apply_paint).pack(anchor="w")
-        ttk.Button(ag, text="应用到当前图", command=self.apply_to_current).pack(fill="x", pady=(6, 2))
-        ttk.Button(ag, text="应用到全部图片", command=self.apply_to_all).pack(fill="x", pady=2)
+        ttk.Button(ag, text="✍ 保存全部改动", command=self.save_all_changes).pack(fill="x", pady=(6, 2))
+        ttk.Button(ag, text="应用到当前图", command=self.apply_to_current).pack(fill="x", pady=2)
+        ttk.Button(ag, text="套用当前参数到全部", command=self.apply_to_all).pack(fill="x", pady=2)
         ttk.Button(ag, text="预览矫正结果", command=self.preview_warp).pack(fill="x", pady=2)
-        ttk.Button(ag, text="重置本图", command=self.reset_image).pack(fill="x", pady=(2, 0))
+        ttk.Button(ag, text="重置本图", command=self.reset_image).pack(fill="x", pady=(2, 2))
+        ttk.Button(ag, text="重置全部改动", command=self.reset_all).pack(fill="x", pady=2)
 
     # ------------------------------------------------------------------ #
     # Event bindings
@@ -161,6 +184,14 @@ class PreprocessFrame(ttk.Frame):
 
     def _set_tool(self) -> None:
         self._tool = self._tool_var.get()
+
+    # --- right-toolbar scroll sizing ---------------------------------------- #
+    def _on_toolbar_size(self, _event) -> None:
+        self.toolbar_canvas.configure(scrollregion=self.toolbar_canvas.bbox("all"))
+
+    def _on_toolbar_view(self, _event) -> None:
+        # Match the inner frame width to the canvas width so buttons stretch.
+        self.toolbar_canvas.itemconfigure(self._toolbar_window, width=self.toolbar_canvas.winfo_width())
 
     # ------------------------------------------------------------------ #
     # Canvas -> image coordinate mapping
@@ -208,6 +239,34 @@ class PreprocessFrame(ttk.Frame):
             self._current_index = 0
         self._load_current()
 
+    # --- per-image edit state --------------------------------------------- #
+    def _current_key(self) -> str:
+        if 0 <= self._current_index < len(self.files):
+            return str(Path(self.files[self._current_index]).resolve()).casefold()
+        return ""
+
+    def _snapshot_current(self) -> None:
+        """Record the current image's quad + strokes so it survives switching."""
+        key = self._current_key()
+        if not key:
+            return
+        self._edits[key] = {
+            "quad": self._quad,
+            "strokes": list(self._painter.strokes),
+        }
+
+    def is_modified(self, path: Path) -> bool:
+        """Whether this file has pending (unsaved) preprocessing edits."""
+        return str(Path(path).resolve()).casefold() in self._edits
+
+    def _mark_modified(self) -> None:
+        """Snapshot the current edit and refresh the list's ●已修改 marker."""
+        self._snapshot_current()
+        self._refresh_marker()
+
+    def _refresh_marker(self) -> None:
+        self.app.refresh_preprocess_markers()
+
     def _load_current(self) -> None:
         if not (0 <= self._current_index < len(self.files)):
             self._title_var.set("未选择图片")
@@ -228,11 +287,22 @@ class PreprocessFrame(ttk.Frame):
             self._title_var.set(f"无法读取：{path.name}")
             return
         self._title_var.set(f"{self._current_index + 1}/{len(self.files)} {path.name}")
-        self._painter.clear()
+        # Restore this image's own saved edits (quad + strokes), falling back to a
+        # fresh auto-detected quad.
+        key = self._current_key()
+        saved = self._edits.get(key)
+        if saved is not None:
+            self._quad = saved.get("quad")
+            self._painter = ip.Painter()
+            for stroke in saved.get("strokes", []):
+                self._painter.add_stroke(stroke)
+        else:
+            self._painter = ip.Painter()
+            self.auto_rectify()
         self._undo.clear()
         self._redo.clear()
-        self.auto_rectify()
         self._fit_zoom()
+        self._render()
 
     def _fit_zoom(self) -> None:
         if self._original is None:
@@ -333,6 +403,7 @@ class PreprocessFrame(ttk.Frame):
         if self._quad is not None:
             self._tool = self.TOOL_DRAG
             self._tool_var.set(self.TOOL_DRAG)
+            self._mark_modified()
         self._render()
 
     def _add_manual_point(self, img_pt: tuple[float, float]) -> None:
@@ -442,10 +513,13 @@ class PreprocessFrame(ttk.Frame):
                 self._undo.append(self._active_stroke)
                 self._undo = self._undo[-self.UNDO_LIMIT:]
                 self._redo.clear()
+                self._mark_modified()
             self._active_stroke = None
             self._render()
             return
-        self._drag_corner = None
+        if self._drag_corner is not None:
+            self._drag_corner = None
+            self._mark_modified()
 
     # ------------------------------------------------------------------ #
     # Color sampling + palette
@@ -516,18 +590,17 @@ class PreprocessFrame(ttk.Frame):
             return
         path = self.files[self._current_index]
         self.app.set_preprocessed(path, cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
+        self._snapshot_current()
+        self._refresh_marker()
         self.app.log_status(f"已应用预处理到 {path.name}")
 
     def apply_to_all(self) -> None:
-        if not self.files:
+        """Apply the *current* image's quad + paint settings to every file."""
+        if not self.files or self._original is None:
             return
-        if self._original is None:
+        current = self._build_processed()
+        if current is None:
             return
-        # Build once from the current image's quad, then apply to every file.
-        result = self._build_processed()
-        if result is None:
-            return
-        current_path = self.files[self._current_index] if 0 <= self._current_index < len(self.files) else None
         for path in list(self.files):
             encoded = np.fromfile(str(path), dtype=np.uint8)
             img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
@@ -539,18 +612,68 @@ class PreprocessFrame(ttk.Frame):
             if self._use_rectify.get() and self._quad is not None:
                 img_out = ip.warp_document(img_out, self._quad, self._add_white_border.get())
             self.app.set_preprocessed(path, cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
+            # Record each file as edited so the ●已修改 marker stays consistent.
+            key = str(Path(path).resolve()).casefold()
+            self._edits.setdefault(key, {})["quad"] = self._quad
+            self._edits.setdefault(key, {})["strokes"] = list(self._painter.strokes)
+        self._refresh_marker()
         self.app.log_status(f"已将预处理参数应用到全部 {len(self.files)} 张图片")
+
+    def save_all_changes(self) -> None:
+        """One-click save: flush every edited image to the OCR cache at once."""
+        if not self.files:
+            return
+        saved = 0
+        for path in list(self.files):
+            key = str(Path(path).resolve()).casefold()
+            edit = self._edits.get(key)
+            if edit is None:
+                continue
+            encoded = np.fromfile(str(path), dtype=np.uint8)
+            img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            img_out = img
+            quad = edit.get("quad")
+            strokes = list(edit.get("strokes", []))
+            if self._apply_paint.get() and strokes:
+                p = ip.Painter()
+                for stroke in strokes:
+                    p.add_stroke(stroke)
+                img_out = p.composite(img)
+            if self._use_rectify.get() and quad is not None:
+                img_out = ip.warp_document(img_out, quad, self._add_white_border.get())
+            self.app.set_preprocessed(path, cv2.imencode(".jpg", img_out, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
+            saved += 1
+        self._refresh_marker()
+        self.app.log_status(f"已保存 {saved} 张图片的预处理改动")
 
     def reset_image(self) -> None:
         if not (0 <= self._current_index < len(self.files)):
             return
         path = self.files[self._current_index]
+        key = str(Path(path).resolve()).casefold()
+        self._edits.pop(key, None)
         self.app.clear_preprocessed(path)
         self._painter.clear()
         self._undo.clear()
         self._redo.clear()
         self.auto_rectify()
+        self._refresh_marker()
         self.app.log_status(f"已重置 {path.name} 的预处理")
+
+    def reset_all(self) -> None:
+        """Clear every edited image's cache and pending edits."""
+        self._edits.clear()
+        for path in list(self.files):
+            self.app.clear_preprocessed(path)
+        if self._original is not None:
+            self._painter.clear()
+            self._undo.clear()
+            self._redo.clear()
+            self.auto_rectify()
+        self._refresh_marker()
+        self.app.log_status("已重置全部图片的预处理改动")
 
     def preview_warp(self) -> None:
         result = self._build_processed()

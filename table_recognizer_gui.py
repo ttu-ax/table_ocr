@@ -852,6 +852,10 @@ def get_preprocessed(path: Path) -> bytes | None:
     return PREPROCESSED_IMAGES.get(_path_key(path))
 
 
+def is_preprocessed(path: Path) -> bool:
+    return _path_key(path) in PREPROCESSED_IMAGES
+
+
 def load_image_bytes(path: Path) -> bytes:
     """Return the preprocessed image for ``path``, else rectify the raw photo."""
     cached = get_preprocessed(path)
@@ -1151,9 +1155,38 @@ class TableRecognizerApp:
     def _refresh_list(self) -> None:
         self.listbox.delete(0, "end")
         for index, path in enumerate(self.files, start=1):
-            self.listbox.insert("end", f"{index:02d}. {path.name}")
+            mark = " ●已修改" if self._preprocess_modified(path) else ""
+            self.listbox.insert("end", f"{index:02d}. {path.name}{mark}")
         self.status.set(f"已添加 {len(self.files)} 张图片")
         self._notify_preprocess_files()
+
+    def refresh_preprocess_markers(self) -> None:
+        """Update the ●已修改 marker text in place, preserving the selection."""
+        if not hasattr(self, "listbox"):
+            return
+        selection = set(self.listbox.curselection())
+        for index, path in enumerate(self.files):
+            item = f"{index + 1:02d}. {path.name}"
+            if self._preprocess_modified(path):
+                item += " ●已修改"
+            self.listbox.delete(index)
+            self.listbox.insert(index, item)
+        # Restore selection by index (list identity is unchanged).
+        for index in selection:
+            if index < len(self.files):
+                self.listbox.selection_set(index)
+
+    def _preprocess_modified(self, path: Path) -> bool:
+        """Whether an image has a pending/unsaved preprocessing edit (or is cached)."""
+        if is_preprocessed(path):
+            return True
+        frame = getattr(self, "_preprocess_frame", None)
+        if frame is None:
+            return False
+        try:
+            return frame.is_modified(path)
+        except Exception:
+            return False
 
     def _notify_preprocess_files(self) -> None:
         frame = getattr(self, "_preprocess_frame", None)
